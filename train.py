@@ -11,6 +11,7 @@ TPU: Kaggle TPU v5e-8 (8 chips)
 
 import argparse
 import functools
+import os
 from pathlib import Path
 from typing import Tuple, Any
 from datetime import datetime
@@ -24,6 +25,7 @@ import orbax.checkpoint as ocp
 import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
+import wandb
 
 from model import DiffusionModel
 
@@ -164,6 +166,24 @@ def train_step(state, images, labels, rng, p_uncond: float = 0.1):
     return state, loss
 
 
+@functools.partial(jax.pmap, axis_name='batch')
+def val_step(state, images, labels, rng):
+    """Forward pass without gradient for validation loss."""
+    outputs, _ = state.apply_fn(
+        {'params': state.params, 'batch_stats': state.batch_stats},
+        images, labels, rng, train=False,
+        mutable=['batch_stats']
+    )
+    noises, imgs, pred_noises, pred_images = outputs
+    noise_loss = l1_loss(pred_noises, noises).mean()
+    image_loss = l1_loss(pred_images, imgs).mean()
+    loss = noise_loss + image_loss
+    noise_loss = jax.lax.pmean(noise_loss, axis_name='batch')
+    image_loss = jax.lax.pmean(image_loss, axis_name='batch')
+    loss = jax.lax.pmean(loss, axis_name='batch')
+    return loss, noise_loss, image_loss
+
+
 @functools.partial(jax.pmap, axis_name='batch',
                    static_broadcasted_argnums=(4, 5))
 def generate_cfg_step(state, ema_params, rng, class_labels,
@@ -221,10 +241,31 @@ def run(data_dir: str,
         val_diffusion_steps: int,
         guidance_scale: float,
         p_uncond: float,
+        log_image_every: int,
         output_dir: Path):
 
     # Hide GPUs from TF so it doesn't grab VRAM (not needed on TPU but keeps things clean)
     tf.config.experimental.set_visible_devices([], 'GPU')
+
+    # W&B init — API key read from environment variable WANDB_API_KEY
+    wandb.login(key=os.environ["WANDB_API_KEY"])
+    wandb.init(
+        project="ddim-fingerprint",
+        config={
+            "data_dir": data_dir,
+            "epochs": epochs,
+            "image_size": image_size,
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "weight_decay": weight_decay,
+            "val_diffusion_steps": val_diffusion_steps,
+            "guidance_scale": guidance_scale,
+            "p_uncond": p_uncond,
+            "num_classes": NUM_CLASSES,
+            "feature_stages": [64, 128, 256, 512],
+            "embedding_dims": 64,
+        },
+    )
 
     n_devices = jax.device_count()
     print(f"JAX devices: {n_devices} x {jax.devices()[0].device_kind}")
@@ -236,8 +277,6 @@ def run(data_dir: str,
 
     # ---- Data ----
     ds_train, ds_val = build_dataset(data_dir, image_size, batch_size)
-    ds_train_np = ds_train.as_numpy_iterator
-    ds_val_np = ds_val.as_numpy_iterator
 
     # ---- Model & optimizer ----
     rng = jax.random.PRNGKey(0)
@@ -283,8 +322,10 @@ def run(data_dir: str,
     ckpt_options = ocp.CheckpointManagerOptions(max_to_keep=3, save_interval_steps=1)
     ckpt_manager = ocp.CheckpointManager(str(ckpt_dir), options=ckpt_options)
 
+    steps_per_val = sum(1 for _ in ds_val)
+
     # ---- Training loop ----
-    rng, rng_train, rng_val = jax.random.split(rng, 3)
+    rng, rng_train, rng_val, rng_val_step = jax.random.split(rng, 4)
 
     for epoch in range(epochs):
         losses = []
@@ -310,7 +351,30 @@ def run(data_dir: str,
             ema_params = jax.tree_util.tree_map(update_ema, ema_params, state.params)
 
         mean_loss = np.mean(losses)
-        print(f'Epoch {epoch+1}: mean_loss={mean_loss:.5f}')
+
+        # Current LR from schedule (use unreplicated step count)
+        current_step = int(jax_utils.unreplicate(state.step))
+        current_lr = float(schedule(current_step))
+
+        # ---- Validation loss on ds_val ----
+        val_losses, val_noise_losses, val_image_losses = [], [], []
+        for val_images, val_labels_batch in ds_val.as_numpy_iterator():
+            val_images = val_images.reshape(n_devices, -1, *val_images.shape[1:])
+            val_labels_batch = val_labels_batch.reshape(n_devices, -1)
+            rng_val_step, vkey = jax.random.split(rng_val_step)
+            vkeys = jax.random.split(vkey, n_devices)
+            v_loss, v_noise_loss, v_image_loss = val_step(
+                state, val_images, val_labels_batch, vkeys
+            )
+            val_losses.append(float(jax_utils.unreplicate(v_loss)))
+            val_noise_losses.append(float(jax_utils.unreplicate(v_noise_loss)))
+            val_image_losses.append(float(jax_utils.unreplicate(v_image_loss)))
+
+        mean_val_loss = np.mean(val_losses)
+        mean_val_noise_loss = np.mean(val_noise_losses)
+        mean_val_image_loss = np.mean(val_image_losses)
+
+        print(f'Epoch {epoch+1}: train_loss={mean_loss:.5f}  val_loss={mean_val_loss:.5f}  lr={current_lr:.2e}')
 
         # ---- Validation: generate one image per class ----
         rng_val, key_gen = jax.random.split(rng_val)
@@ -325,17 +389,38 @@ def run(data_dir: str,
         )
         # Collect from devices: (n_devices, B_per_device, H, W, 1) -> (N, H, W, 1)
         generated = generated.reshape(-1, image_size, image_size, 1)
+        generated_np = np.array(generated)
 
         with summary_writer.as_default():
             tf.summary.scalar('train/loss', mean_loss, step=epoch)
-            # Tile grayscale to 3 channels for TensorBoard image display
-            gen_rgb = np.repeat(np.array(generated), 3, axis=-1)
+            tf.summary.scalar('val/loss', mean_val_loss, step=epoch)
+            tf.summary.scalar('val/noise_loss', mean_val_noise_loss, step=epoch)
+            tf.summary.scalar('val/image_loss', mean_val_image_loss, step=epoch)
+            gen_rgb = np.repeat(generated_np, 3, axis=-1)
             tf.summary.image('generated/per_class', gen_rgb,
                              step=epoch, max_outputs=NUM_CLASSES)
+
+        # ---- W&B logging (per epoch, images every log_image_every epochs) ----
+        log_dict = {
+            "epoch": epoch + 1,
+            "train/loss": mean_loss,
+            "train/lr": current_lr,
+            "val/loss": mean_val_loss,
+            "val/noise_loss": mean_val_noise_loss,
+            "val/image_loss": mean_val_image_loss,
+        }
+        if (epoch + 1) % log_image_every == 0:
+            log_dict["generated/per_class"] = [
+                wandb.Image(generated_np[i, :, :, 0],
+                            caption=f"sensor_{SENSORS[i]}")
+                for i in range(NUM_CLASSES)
+            ]
+        wandb.log(log_dict, step=epoch + 1)
 
         save_ckpt(ckpt_manager, state, ema_params, step=epoch)
 
     ckpt_manager.wait_until_finished()
+    wandb.finish()
     print('Training complete. Checkpoints saved to:', ckpt_dir)
 
 
@@ -360,6 +445,8 @@ if __name__ == '__main__':
     parser.add_argument('--guidance-scale', type=float, default=3.0)
     parser.add_argument('--p-uncond', type=float, default=0.1,
                         help='Probability of dropping class label to null during training')
+    parser.add_argument('--log-image-every', type=int, default=5,
+                        help='Log generated images to W&B every N epochs')
     now = datetime.now().strftime('%Y%m%d-%H%M%S')
     parser.add_argument('-o', '--output-dir', type=Path,
                         default=f'/kaggle/working/outputs/{now}')
