@@ -1,19 +1,15 @@
-"""Conditional DDIM training with Classifier-Free Guidance on Kaggle TPU v5e-8.
+"""Conditional DDIM with Patch-Diffusion + CFG on Kaggle TPU v5e-8.
 
-Dataset: NIST SD 302a fingerprint images
-  - 8 sensor classes: A, B, C, D, E, F, G, H
-  - Images: 512x512 grayscale PNG, resized to IMAGE_SIZE x IMAGE_SIZE
-
-TPU: Kaggle TPU v5e-8 (8 chips)
-  - Uses jax.pmap for data-parallel training across 8 devices
-  - Batch is sharded: (BATCH_SIZE, H, W, 1) -> (8, BATCH_SIZE//8, H, W, 1)
+Dataset: NIST SD 302a fingerprint images (8 sensor classes, grayscale)
+Training: multi-scale random patches [64, 128, 256] with position conditioning
+TPU: 8-chip data-parallel via jax.pmap
 """
 
 import argparse
 import functools
 import os
 from pathlib import Path
-from typing import Tuple, Any
+from typing import Tuple
 from datetime import datetime
 
 import jax
@@ -32,7 +28,49 @@ from model import DiffusionModel
 
 SENSORS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
 NUM_CLASSES = len(SENSORS)
-NULL_CLASS = NUM_CLASSES  # index 8 = unconditional token for CFG
+NULL_CLASS = NUM_CLASSES
+
+PATCH_SIZES = [64, 128, 256]
+PATCH_PROBS = [0.2, 0.3, 0.5]
+
+
+# ---------------------------------------------------------------------------
+# Patch-Diffusion helpers
+# ---------------------------------------------------------------------------
+
+def make_pos_grid(patch_size: int, offset_y: int, offset_x: int,
+                  full_res: int) -> np.ndarray:
+    """Position grid (ps, ps, 2) with (x, y) in [-1, 1]."""
+    y = np.arange(patch_size, dtype=np.float32) + offset_y
+    x = np.arange(patch_size, dtype=np.float32) + offset_x
+    y = (y / (full_res - 1) - 0.5) * 2.0
+    x = (x / (full_res - 1) - 0.5) * 2.0
+    xx, yy = np.meshgrid(x, y)
+    return np.stack([xx, yy], axis=-1)
+
+
+def pachify_numpy(images: np.ndarray, patch_size: int,
+                  full_res: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Random-crop patches + position grids on CPU."""
+    B, H, W, C = images.shape
+    if patch_size >= H:
+        pos_single = make_pos_grid(H, 0, 0, full_res)
+        pos = np.broadcast_to(pos_single[None], (B, H, W, 2)).copy()
+        return images, pos
+    patches = np.empty((B, patch_size, patch_size, C), dtype=images.dtype)
+    pos = np.empty((B, patch_size, patch_size, 2), dtype=np.float32)
+    for i in range(B):
+        oy = np.random.randint(0, H - patch_size + 1)
+        ox = np.random.randint(0, W - patch_size + 1)
+        patches[i] = images[i, oy:oy + patch_size, ox:ox + patch_size, :]
+        pos[i] = make_pos_grid(patch_size, oy, ox, full_res)
+    return patches, pos
+
+
+def make_full_pos(image_size: int, batch_size: int) -> np.ndarray:
+    """Full coordinate grid for inference / validation."""
+    pos_single = make_pos_grid(image_size, 0, 0, image_size)
+    return np.tile(pos_single[None], (batch_size, 1, 1, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +78,6 @@ NULL_CLASS = NUM_CLASSES  # index 8 = unconditional token for CFG
 # ---------------------------------------------------------------------------
 
 def build_file_label_lists(data_dir: str):
-    """Collect all PNG file paths and corresponding integer class labels."""
     data_dir = Path(data_dir)
     paths, labels = [], []
     for label_idx, sensor in enumerate(SENSORS):
@@ -56,10 +93,8 @@ def build_file_label_lists(data_dir: str):
 def preprocess_image(image_path: tf.Tensor, label: tf.Tensor,
                      image_size: int) -> Tuple[tf.Tensor, tf.Tensor]:
     raw = tf.io.read_file(image_path)
-    image = tf.image.decode_png(raw, channels=1)  # (H, W, 1) uint8
+    image = tf.image.decode_png(raw, channels=1)
     image = tf.cast(image, tf.float32)
-
-    # Center crop to square then resize
     h = tf.shape(image)[0]
     w = tf.shape(image)[1]
     crop = tf.minimum(h, w)
@@ -68,13 +103,17 @@ def preprocess_image(image_path: tf.Tensor, label: tf.Tensor,
                                           (w - crop) // 2,
                                           crop, crop)
     image = tf.image.resize(image, (image_size, image_size), antialias=True)
-    image = tf.clip_by_value(image / 255.0, 0.0, 1.0)  # (image_size, image_size, 1)
+    image = tf.clip_by_value(image / 255.0, 0.0, 1.0)
     return image, label
 
 
+def _augment_flip(image, label):
+    return tf.image.random_flip_left_right(image), label
+
+
 def build_dataset(data_dir: str,
-                  image_size: int = 128,
-                  batch_size: int = 512,
+                  image_size: int = 256,
+                  batch_size: int = 64,
                   val_fraction: float = 0.1,
                   seed: int = 42):
     paths, labels = build_file_label_lists(data_dir)
@@ -90,7 +129,7 @@ def build_dataset(data_dir: str,
 
     preprocess_fn = functools.partial(preprocess_image, image_size=image_size)
 
-    def make_split(split_paths, split_labels, shuffle: bool):
+    def make_split(split_paths, split_labels, shuffle: bool, augment: bool):
         ds = tf.data.Dataset.from_tensor_slices(
             (split_paths, tf.cast(split_labels, tf.int32))
         )
@@ -100,25 +139,21 @@ def build_dataset(data_dir: str,
         ds = ds.cache()
         if shuffle:
             ds = ds.shuffle(buffer_size=min(len(split_paths), 5000))
+        if augment:
+            ds = ds.map(_augment_flip, num_parallel_calls=tf.data.AUTOTUNE)
         ds = ds.batch(batch_size, drop_remainder=True)
         ds = ds.prefetch(tf.data.AUTOTUNE)
         return ds
 
-    ds_train = make_split(train_paths, train_labels, shuffle=True)
-    ds_val = make_split(val_paths, val_labels, shuffle=False)
+    ds_train = make_split(train_paths, train_labels,
+                          shuffle=True, augment=True)
+    ds_val = make_split(val_paths, val_labels,
+                        shuffle=False, augment=False)
     return ds_train, ds_val
 
 
 # ---------------------------------------------------------------------------
-# Train state
-# ---------------------------------------------------------------------------
-
-class TrainState(train_state.TrainState):
-    batch_stats: Any
-
-
-# ---------------------------------------------------------------------------
-# Loss
+# Loss & EMA
 # ---------------------------------------------------------------------------
 
 def l1_loss(predictions, targets):
@@ -130,74 +165,58 @@ def update_ema(p_cur, p_new, momentum: float = 0.999):
 
 
 # ---------------------------------------------------------------------------
-# Train / eval steps (pmap-compatible)
+# Train / eval steps (pmap)
 # ---------------------------------------------------------------------------
 
-@functools.partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(4,))
-def train_step(state, images, labels, rng, p_uncond: float = 0.1):
-    # Randomly drop labels to null class for CFG training
+@functools.partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(5,))
+def train_step(state, images, pos, labels, rng, p_uncond: float = 0.1):
     rng, rng_drop = jax.random.split(rng)
     drop_mask = jax.random.bernoulli(rng_drop, p_uncond, labels.shape)
     labels_in = jnp.where(drop_mask, NULL_CLASS, labels)
 
     def loss_fn(params):
-        outputs, mutated_vars = state.apply_fn(
-            {'params': params, 'batch_stats': state.batch_stats},
-            images, labels_in, rng, train=True,
-            mutable=['batch_stats']
+        outputs = state.apply_fn(
+            {'params': params},
+            images, labels_in, pos, rng,
         )
         noises, imgs, pred_noises, pred_images = outputs
         noise_loss = l1_loss(pred_noises, noises).mean()
         image_loss = l1_loss(pred_images, imgs).mean()
-        loss = noise_loss + image_loss
-        return loss, mutated_vars
+        return noise_loss + image_loss
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, mutated_vars), grads = grad_fn(state.params)
-
-    # Average gradients and loss across devices
+    grad_fn = jax.value_and_grad(loss_fn)
+    loss, grads = grad_fn(state.params)
     grads = jax.lax.pmean(grads, axis_name='batch')
     loss = jax.lax.pmean(loss, axis_name='batch')
-
-    state = state.apply_gradients(
-        grads=grads,
-        batch_stats=mutated_vars['batch_stats']
-    )
+    state = state.apply_gradients(grads=grads)
     return state, loss
 
 
 @functools.partial(jax.pmap, axis_name='batch')
-def val_step(state, images, labels, rng):
-    """Forward pass without gradient for validation loss."""
-    outputs, _ = state.apply_fn(
-        {'params': state.params, 'batch_stats': state.batch_stats},
-        images, labels, rng, train=False,
-        mutable=['batch_stats']
+def val_step(state, images, pos, labels, rng):
+    outputs = state.apply_fn(
+        {'params': state.params},
+        images, labels, pos, rng,
     )
     noises, imgs, pred_noises, pred_images = outputs
     noise_loss = l1_loss(pred_noises, noises).mean()
     image_loss = l1_loss(pred_images, imgs).mean()
     loss = noise_loss + image_loss
-    noise_loss = jax.lax.pmean(noise_loss, axis_name='batch')
-    image_loss = jax.lax.pmean(image_loss, axis_name='batch')
-    loss = jax.lax.pmean(loss, axis_name='batch')
-    return loss, noise_loss, image_loss
+    return (jax.lax.pmean(loss, axis_name='batch'),
+            jax.lax.pmean(noise_loss, axis_name='batch'),
+            jax.lax.pmean(image_loss, axis_name='batch'))
 
 
 @functools.partial(jax.pmap, axis_name='batch',
-                   static_broadcasted_argnums=(4, 5))
-def generate_cfg_step(state, ema_params, rng, class_labels,
+                   static_broadcasted_argnums=(5, 6))
+def generate_cfg_step(state, ema_params, rng, class_labels, pos,
                       diffusion_steps: int, guidance_scale: float):
-    """Generate images with CFG on a single device shard."""
-    variables = {'params': ema_params, 'batch_stats': state.batch_stats}
+    variables = {'params': ema_params}
+    image_shape = (class_labels.shape[0], pos.shape[1], pos.shape[2], 1)
     generated = state.apply_fn(
-        variables,
-        rng,
-        (class_labels.shape[0], 128, 128, 1),  # image_shape per device
-        class_labels,
-        diffusion_steps,
-        guidance_scale,
-        method=DiffusionModel.generate_cfg
+        variables, rng, image_shape, class_labels, pos,
+        diffusion_steps, guidance_scale,
+        method=DiffusionModel.generate_cfg,
     )
     return generated
 
@@ -216,7 +235,7 @@ def save_ckpt(ckpt_manager, state, ema_params, step: int):
 
 
 # ---------------------------------------------------------------------------
-# Output / logging helpers
+# Output helpers
 # ---------------------------------------------------------------------------
 
 def create_output_dir(output_dir: Path):
@@ -244,10 +263,8 @@ def run(data_dir: str,
         log_image_every: int,
         output_dir: Path):
 
-    # Hide GPUs from TF so it doesn't grab VRAM (not needed on TPU but keeps things clean)
     tf.config.experimental.set_visible_devices([], 'GPU')
 
-    # W&B init — API key read from environment variable WANDB_API_KEY
     wandb.login(key=os.environ["WANDB_API_KEY"])
     wandb.init(
         project="ddim-fingerprint",
@@ -263,7 +280,9 @@ def run(data_dir: str,
             "p_uncond": p_uncond,
             "num_classes": NUM_CLASSES,
             "feature_stages": [64, 128, 256, 512],
-            "embedding_dims": 64,
+            "cond_dims": 256,
+            "patch_sizes": PATCH_SIZES,
+            "patch_probs": PATCH_PROBS,
         },
     )
 
@@ -282,14 +301,13 @@ def run(data_dir: str,
     rng = jax.random.PRNGKey(0)
     rng, key_init, key_diffusion = jax.random.split(rng, 3)
 
-    # Total steps for cosine decay schedule
     steps_per_epoch = sum(1 for _ in ds_train)
     total_steps = epochs * steps_per_epoch
 
     schedule = optax.cosine_decay_schedule(
         init_value=learning_rate,
         decay_steps=total_steps,
-        alpha=1e-2  # final lr = learning_rate * alpha
+        alpha=1e-2,
     )
     tx = optax.adamw(schedule, weight_decay=weight_decay)
 
@@ -298,122 +316,136 @@ def run(data_dir: str,
         blocks=2,
         num_classes=NUM_CLASSES,
         embedding_dims=64,
-        class_embed_dims=64,
+        cond_dims=256,
     )
 
-    # Init with dummy grayscale batch
-    dummy_images = jnp.ones((1, image_size, image_size, 1), dtype=jnp.float32)
-    dummy_labels = jnp.zeros((1,), dtype=jnp.int32)
-    variables = model.init(key_init, dummy_images, dummy_labels, key_diffusion,
-                           train=True)
+    dummy_images = jnp.ones((1, image_size, image_size, 1), jnp.float32)
+    dummy_labels = jnp.zeros((1,), jnp.int32)
+    dummy_pos = jnp.zeros((1, image_size, image_size, 2), jnp.float32)
+    variables = model.init(key_init, dummy_images, dummy_labels,
+                           dummy_pos, key_diffusion)
 
-    state = TrainState.create(
+    state = train_state.TrainState.create(
         apply_fn=model.apply,
         params=variables['params'],
-        batch_stats=variables['batch_stats'],
         tx=tx,
     )
 
-    # Replicate state across all devices
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(variables['params'])
 
-    # Orbax checkpoint manager
-    ckpt_options = ocp.CheckpointManagerOptions(max_to_keep=3, save_interval_steps=1)
+    ckpt_options = ocp.CheckpointManagerOptions(
+        max_to_keep=3, save_interval_steps=1)
     ckpt_manager = ocp.CheckpointManager(str(ckpt_dir), options=ckpt_options)
 
-    steps_per_val = sum(1 for _ in ds_val)
+    # Pre-compute full pos grid for validation / generation
+    full_pos_val = make_full_pos(image_size, batch_size)
+    full_pos_gen = make_full_pos(image_size, NUM_CLASSES)
 
     # ---- Training loop ----
     rng, rng_train, rng_val, rng_val_step = jax.random.split(rng, 4)
 
     for epoch in range(epochs):
         losses = []
-        pbar = tqdm(ds_train.as_numpy_iterator(), desc=f'Epoch {epoch+1}/{epochs}',
+        pbar = tqdm(ds_train.as_numpy_iterator(),
+                    desc=f'Epoch {epoch + 1}/{epochs}',
                     total=steps_per_epoch)
 
         for images, labels in pbar:
-            # Shard batch across devices: (B, H, W, C) -> (n_devices, B//n, H, W, C)
-            images = images.reshape(n_devices, -1, *images.shape[1:])
-            labels = labels.reshape(n_devices, -1)
+            # Multi-scale patch crop + position grid
+            patch_size = int(np.random.choice(PATCH_SIZES, p=PATCH_PROBS))
+            patches, pos = pachify_numpy(images, patch_size,
+                                         full_res=image_size)
+
+            patches = patches.reshape(
+                n_devices, -1, patch_size, patch_size, 1)
+            pos = pos.reshape(
+                n_devices, -1, patch_size, patch_size, 2)
+            labels_shard = labels.reshape(n_devices, -1)
 
             rng_train, key = jax.random.split(rng_train)
-            # Replicate per-step rng across devices (each device gets same key — split inside pmap is fine)
             keys = jax.random.split(key, n_devices)
 
-            state, loss = train_step(state, images, labels, keys, p_uncond)
+            state, loss = train_step(state, patches, pos,
+                                     labels_shard, keys, p_uncond)
 
             loss_val = float(jax_utils.unreplicate(loss))
-            pbar.set_postfix({'loss': f'{loss_val:.5f}'})
+            pbar.set_postfix({'loss': f'{loss_val:.5f}', 'ps': patch_size})
             losses.append(loss_val)
 
-            # EMA update on all replicas
-            ema_params = jax.tree_util.tree_map(update_ema, ema_params, state.params)
+            ema_params = jax.tree_util.tree_map(
+                update_ema, ema_params, state.params)
 
         mean_loss = np.mean(losses)
-
-        # Current LR from schedule (use unreplicated step count)
         current_step = int(jax_utils.unreplicate(state.step))
         current_lr = float(schedule(current_step))
 
-        # ---- Validation loss on ds_val ----
+        # ---- Validation loss (full images) ----
         val_losses, val_noise_losses, val_image_losses = [], [], []
         for val_images, val_labels_batch in ds_val.as_numpy_iterator():
-            val_images = val_images.reshape(n_devices, -1, *val_images.shape[1:])
+            bs_actual = val_images.shape[0]
+            val_pos = full_pos_val[:bs_actual]
+            val_images = val_images.reshape(
+                n_devices, -1, image_size, image_size, 1)
+            val_pos = val_pos.reshape(
+                n_devices, -1, image_size, image_size, 2)
             val_labels_batch = val_labels_batch.reshape(n_devices, -1)
+
             rng_val_step, vkey = jax.random.split(rng_val_step)
             vkeys = jax.random.split(vkey, n_devices)
-            v_loss, v_noise_loss, v_image_loss = val_step(
-                state, val_images, val_labels_batch, vkeys
-            )
+            v_loss, v_noise, v_image = val_step(
+                state, val_images, val_pos, val_labels_batch, vkeys)
             val_losses.append(float(jax_utils.unreplicate(v_loss)))
-            val_noise_losses.append(float(jax_utils.unreplicate(v_noise_loss)))
-            val_image_losses.append(float(jax_utils.unreplicate(v_image_loss)))
+            val_noise_losses.append(float(jax_utils.unreplicate(v_noise)))
+            val_image_losses.append(float(jax_utils.unreplicate(v_image)))
 
-        mean_val_loss = np.mean(val_losses)
-        mean_val_noise_loss = np.mean(val_noise_losses)
-        mean_val_image_loss = np.mean(val_image_losses)
+        mean_val = np.mean(val_losses) if val_losses else 0.0
+        mean_val_noise = np.mean(val_noise_losses) if val_noise_losses else 0.0
+        mean_val_image = np.mean(val_image_losses) if val_image_losses else 0.0
 
-        print(f'Epoch {epoch+1}: train_loss={mean_loss:.5f}  val_loss={mean_val_loss:.5f}  lr={current_lr:.2e}')
+        print(f'Epoch {epoch + 1}: train={mean_loss:.5f}  '
+              f'val={mean_val:.5f}  lr={current_lr:.2e}')
 
-        # ---- Validation: generate one image per class ----
+        # ---- Generate one image per class (full resolution) ----
         rng_val, key_gen = jax.random.split(rng_val)
-        # Generate 1 image per class (8 total), distribute evenly across devices
-        val_labels = jnp.arange(NUM_CLASSES, dtype=jnp.int32)
-        val_labels = val_labels.reshape(n_devices, -1)  # (8, 1) if n_devices==8
+        gen_labels = jnp.arange(NUM_CLASSES, dtype=jnp.int32)
+        gen_labels = gen_labels.reshape(n_devices, -1)
+        gen_pos = full_pos_gen.reshape(
+            n_devices, -1, image_size, image_size, 2)
         key_gen_devices = jax.random.split(key_gen, n_devices)
 
         generated = generate_cfg_step(
-            state, ema_params, key_gen_devices, val_labels,
-            val_diffusion_steps, guidance_scale
+            state, ema_params, key_gen_devices,
+            gen_labels, gen_pos,
+            val_diffusion_steps, guidance_scale,
         )
-        # Collect from devices: (n_devices, B_per_device, H, W, 1) -> (N, H, W, 1)
         generated = generated.reshape(-1, image_size, image_size, 1)
         generated_np = np.array(generated)
 
+        # ---- TensorBoard ----
         with summary_writer.as_default():
             tf.summary.scalar('train/loss', mean_loss, step=epoch)
-            tf.summary.scalar('val/loss', mean_val_loss, step=epoch)
-            tf.summary.scalar('val/noise_loss', mean_val_noise_loss, step=epoch)
-            tf.summary.scalar('val/image_loss', mean_val_image_loss, step=epoch)
+            tf.summary.scalar('val/loss', mean_val, step=epoch)
+            tf.summary.scalar('val/noise_loss', mean_val_noise, step=epoch)
+            tf.summary.scalar('val/image_loss', mean_val_image, step=epoch)
             gen_rgb = np.repeat(generated_np, 3, axis=-1)
             tf.summary.image('generated/per_class', gen_rgb,
                              step=epoch, max_outputs=NUM_CLASSES)
 
-        # ---- W&B logging (per epoch, images every log_image_every epochs) ----
+        # ---- W&B (sparse image logging) ----
         log_dict = {
             "epoch": epoch + 1,
             "train/loss": mean_loss,
             "train/lr": current_lr,
-            "val/loss": mean_val_loss,
-            "val/noise_loss": mean_val_noise_loss,
-            "val/image_loss": mean_val_image_loss,
+            "val/loss": mean_val,
+            "val/noise_loss": mean_val_noise,
+            "val/image_loss": mean_val_image,
         }
         if (epoch + 1) % log_image_every == 0:
             log_dict["generated/per_class"] = [
                 wandb.Image(generated_np[i, :, :, 0],
                             caption=f"sensor_{SENSORS[i]}")
-                for i in range(NUM_CLASSES)
+                for i in range(min(NUM_CLASSES, generated_np.shape[0]))
             ]
         wandb.log(log_dict, step=epoch + 1)
 
@@ -429,24 +461,21 @@ def run(data_dir: str,
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Conditional DDIM with CFG - Fingerprint')
+    parser = argparse.ArgumentParser(
+        description='Conditional DDIM + Patch-Diffusion + CFG — Fingerprint')
 
-    # On Kaggle, dataset is mounted at /kaggle/input/<dataset-name>/images
     parser.add_argument('--data-dir', type=str,
-                        default='/kaggle/input/nist-sd302a/images',
-                        help='Path to the images/ directory of NIST SD 302a')
-    parser.add_argument('-e', '--epochs', type=int, default=100)
-    parser.add_argument('--image-size', type=int, default=128)
-    parser.add_argument('-b', '--batch-size', type=int, default=512,
-                        help='Total batch size across all devices (must be divisible by n_devices)')
+                        default='/kaggle/input/nist-sd302a/images')
+    parser.add_argument('-e', '--epochs', type=int, default=500)
+    parser.add_argument('--image-size', type=int, default=256)
+    parser.add_argument('-b', '--batch-size', type=int, default=64,
+                        help='Total batch across all devices')
     parser.add_argument('-lr', '--learning-rate', type=float, default=1e-4)
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--val-diffusion-steps', type=int, default=80)
     parser.add_argument('--guidance-scale', type=float, default=3.0)
-    parser.add_argument('--p-uncond', type=float, default=0.1,
-                        help='Probability of dropping class label to null during training')
-    parser.add_argument('--log-image-every', type=int, default=5,
-                        help='Log generated images to W&B every N epochs')
+    parser.add_argument('--p-uncond', type=float, default=0.1)
+    parser.add_argument('--log-image-every', type=int, default=5)
     now = datetime.now().strftime('%Y%m%d-%H%M%S')
     parser.add_argument('-o', '--output-dir', type=Path,
                         default=f'/kaggle/working/outputs/{now}')
