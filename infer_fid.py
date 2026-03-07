@@ -44,7 +44,7 @@ from train import make_full_pos, SENSORS, NUM_CLASSES
 
 def load_ema_params(ckpt_dir: str, model: DiffusionModel,
                     image_size: int):
-    """Restore ema_params from an orbax checkpoint directory."""
+    """Restore only ema_params from an orbax checkpoint directory."""
     dummy_images = jnp.ones((1, image_size, image_size, 1), jnp.float32)
     dummy_labels = jnp.zeros((1,), jnp.int32)
     dummy_pos = jnp.zeros((1, image_size, image_size, 2), jnp.float32)
@@ -52,13 +52,7 @@ def load_ema_params(ckpt_dir: str, model: DiffusionModel,
 
     variables = model.init(dummy_rng, dummy_images, dummy_labels,
                            dummy_pos, dummy_rng)
-
-    tx = optax.adamw(1e-4)
-    state = train_state.TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
-        tx=tx,
-    )
+    dummy_ema = variables['params']
 
     ckpt_manager = ocp.CheckpointManager(
         str(ckpt_dir),
@@ -67,10 +61,11 @@ def load_ema_params(ckpt_dir: str, model: DiffusionModel,
     step = ckpt_manager.latest_step()
     print(f"Restoring checkpoint step {step} from {ckpt_dir}")
 
-    restored = ckpt_manager.restore(step, args=ocp.args.StandardRestore({
-        'state': state,
-        'ema_params': variables['params'],
-    }))
+    # Restore only ema_params — skip state to avoid optimizer struct mismatch
+    restored = ckpt_manager.restore(
+        step,
+        args=ocp.args.StandardRestore({'ema_params': dummy_ema}),
+    )
     return restored['ema_params']
 
 
