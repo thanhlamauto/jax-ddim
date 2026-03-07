@@ -28,13 +28,13 @@ class ResidualBlock(nn.Module):
         # AdaGN: conditioning -> per-channel scale & shift
         scale_shift = nn.Dense(self.features * 2)(nn.swish(cond_emb))
         scale, shift = jnp.split(scale_shift, 2, axis=-1)
-        scale = scale[:, None, None, :]
-        shift = shift[:, None, None, :]
+        scale = scale[:, None, None, :]  # (B, 1, 1, features)
+        shift = shift[:, None, None, :]  # (B, 1, 1, features)
 
-        if x.shape[-1] == self.features:
-            residual = x
-        else:
-            residual = nn.Conv(self.features, kernel_size=(1, 1))(x)
+        # Project input channels to self.features if needed (shared for residual)
+        if x.shape[-1] != self.features:
+            x = nn.Conv(self.features, kernel_size=(1, 1))(x)
+        residual = x
 
         x = nn.GroupNorm(num_groups=min(8, self.features))(x)
         x = x * (1 + scale) + shift
