@@ -61,13 +61,11 @@ def load_ema_params(ckpt_dir: str, model: DiffusionModel,
     step = ckpt_manager.latest_step()
     print(f"Restoring checkpoint step {step} from {ckpt_dir}")
 
-    # Use partial_restore=True so orbax ignores keys on disk not in our target
+    # Use partial_restore=True so orbax ignores extra keys on disk (state, opt_state)
     restored = ckpt_manager.restore(
         step,
-        args=ocp.args.StandardRestore(
-            {'ema_params': dummy_ema},
-            partial_restore=True,
-        ),
+        args=ocp.args.StandardRestore({'ema_params': dummy_ema}),
+        partial_restore=True,
     )
     return restored['ema_params']
 
