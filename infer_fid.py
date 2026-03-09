@@ -1,21 +1,38 @@
-"""FID4K evaluation for fingerprint DDIM.
+"""FID evaluation for fingerprint DDIM — unconditional or CFG.
 
-Generates 4000 images (500 per sensor class) with CFG, then computes FID
-against the real NIST SD 302a training images.
+Two modes
+---------
+Unconditional (default, recommended for FID):
+    Generates n_samples images using NULL_CLASS token (no class guidance),
+    then computes FID against a random sample of real images from all sensors.
 
-Usage on Kaggle:
     python infer_fid.py \
-        --ckpt-dir /kaggle/input/ddim-ckpt/499 \
-        --data-dir /kaggle/input/nist-sd302a/images \
+        --ckpt-dir /kaggle/input/models/nhibui916/patch-diffusion-fingerprint/flax/default/1 \
+        --data-dir /kaggle/input/fingerprint-challengers/images \
         --image-size 256 \
-        --n-samples 4000 \
+        --n-samples 8000 \
         --diffusion-steps 80 \
-        --guidance-scale 3.0 \
-        --out-dir /kaggle/working/fid_samples
+        --batch-per-device 16 \
+        --unconditional \
+        --out-dir /kaggle/working/fid_eval
 
-Install deps (in addition to train deps):
-    pip install -q torch torchvision  # needed for pytorch-fid
-    pip install -q pytorch-fid
+CFG / class-conditional (legacy):
+    Generates n_samples/8 images per sensor class with classifier-free guidance.
+
+    python infer_fid.py \
+        --ckpt-dir /kaggle/input/models/nhibui916/patch-diffusion-fingerprint/flax/default/1 \
+        --data-dir /kaggle/input/fingerprint-challengers/images \
+        --n-samples 8000 \
+        --guidance-scale 3.0 \
+        --out-dir /kaggle/working/fid_eval
+
+Notes
+-----
+- --ckpt-dir must point to the *parent* directory that contains numbered
+  step folders (e.g. .../1  which contains  .../1/499/).
+  Orbax CheckpointManager will automatically pick the latest step (499).
+- Install deps: pip install -q torch torchvision pytorch-fid
+- TPU v5e-8 has 8 devices; use --batch-per-device 16 (128 imgs/step).
 """
 
 import argparse
@@ -35,7 +52,7 @@ import subprocess
 import sys
 
 from model import DiffusionModel
-from train import make_full_pos, SENSORS, NUM_CLASSES
+from train import make_full_pos, SENSORS, NUM_CLASSES, NULL_CLASS
 
 
 # ---------------------------------------------------------------------------
@@ -87,18 +104,31 @@ def generate_batch(state, ema_params, rng, class_labels, pos,
     )
 
 
+@functools.partial(jax.pmap, axis_name='batch',
+                   static_broadcasted_argnums=(4,))
+def generate_batch_uncond(state, ema_params, rng, pos, diffusion_steps: int):
+    """Unconditional generation: uses NULL_CLASS token, no CFG."""
+    variables = {'params': ema_params}
+    batch_per_device = pos.shape[0]
+    image_shape = (batch_per_device, pos.shape[1], pos.shape[2], 1)
+    null_labels = jnp.full((batch_per_device,), NULL_CLASS, dtype=jnp.int32)
+    return state.apply_fn(
+        variables, rng, image_shape, null_labels, pos,
+        diffusion_steps,
+        method=DiffusionModel.generate,
+    )
+
+
 def generate_samples(ema_params, model, image_size: int,
                      n_per_class: int, diffusion_steps: int,
                      guidance_scale: float, out_dir: Path,
                      seed: int = 0):
-    """Generate n_per_class images for each of the 8 sensor classes."""
+    """Generate n_per_class images for each of the 8 sensor classes (CFG)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     for sensor in SENSORS:
         (out_dir / sensor).mkdir(exist_ok=True)
 
     n_devices = jax.device_count()
-    # batch_size must be divisible by n_devices and num_classes
-    # generate per-class in rounds
     batch_per_device = max(1, 8 // n_devices)  # images per device per step
     batch_size = batch_per_device * n_devices
 
@@ -106,20 +136,7 @@ def generate_samples(ema_params, model, image_size: int,
     full_pos_sharded = full_pos.reshape(
         n_devices, batch_per_device, image_size, image_size, 2)
 
-    # Replicate state (we only need ema_params + apply_fn via a dummy state)
-    tx = optax.adamw(1e-4)
-    dummy_images = jnp.ones((1, image_size, image_size, 1), jnp.float32)
-    dummy_labels = jnp.zeros((1,), jnp.int32)
-    dummy_pos = jnp.zeros((1, image_size, image_size, 2), jnp.float32)
-    dummy_rng = jax.random.PRNGKey(seed)
-    variables = model.init(dummy_rng, dummy_images, dummy_labels,
-                           dummy_pos, dummy_rng)
-    state = train_state.TrainState.create(
-        apply_fn=model.apply,
-        params=variables['params'],
-        tx=tx,
-    )
-    state = jax_utils.replicate(state)
+    state = _build_dummy_state(model, image_size, seed)
     ema_params_rep = jax_utils.replicate(ema_params)
 
     rng = jax.random.PRNGKey(seed)
@@ -164,13 +181,85 @@ def generate_samples(ema_params, model, image_size: int,
     print(f"Generated images saved to {out_dir}")
 
 
+def _build_dummy_state(model, image_size, seed):
+    """Shared helper: init model + replicate a dummy TrainState."""
+    tx = optax.adamw(1e-4)
+    dummy_images = jnp.ones((1, image_size, image_size, 1), jnp.float32)
+    dummy_labels = jnp.zeros((1,), jnp.int32)
+    dummy_pos = jnp.zeros((1, image_size, image_size, 2), jnp.float32)
+    dummy_rng = jax.random.PRNGKey(seed)
+    variables = model.init(dummy_rng, dummy_images, dummy_labels,
+                           dummy_pos, dummy_rng)
+    state = train_state.TrainState.create(
+        apply_fn=model.apply,
+        params=variables['params'],
+        tx=tx,
+    )
+    return jax_utils.replicate(state)
+
+
+def generate_samples_uncond(ema_params, model, image_size: int,
+                             n_samples: int, diffusion_steps: int,
+                             out_dir: Path, batch_per_device: int = 16,
+                             seed: int = 0):
+    """Generate n_samples unconditional images (NULL_CLASS, no CFG) into out_dir.
+
+    All images are saved flat (no sensor subdirectories).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    n_devices = jax.device_count()
+    batch_size = batch_per_device * n_devices
+    print(f"Unconditional generation: {n_samples} images, "
+          f"{n_devices} devices × {batch_per_device} = {batch_size} imgs/step")
+
+    full_pos = make_full_pos(image_size, batch_size)
+    full_pos_sharded = full_pos.reshape(
+        n_devices, batch_per_device, image_size, image_size, 2)
+
+    state = _build_dummy_state(model, image_size, seed)
+    ema_params_rep = jax_utils.replicate(ema_params)
+
+    rng = jax.random.PRNGKey(seed)
+    saved = 0
+    pbar = tqdm(total=n_samples, desc='Generating (uncond)')
+
+    while saved < n_samples:
+        rng, key = jax.random.split(rng)
+        keys = jax.random.split(key, n_devices)
+
+        generated = generate_batch_uncond(
+            state, ema_params_rep, keys,
+            full_pos_sharded, diffusion_steps,
+        )
+        generated = np.array(generated).reshape(
+            batch_size, image_size, image_size, 1)
+
+        for img_arr in generated:
+            if saved >= n_samples:
+                break
+            img = Image.fromarray(
+                (img_arr[:, :, 0] * 255).clip(0, 255).astype(np.uint8),
+                mode='L'
+            )
+            img.save(out_dir / f'{saved:05d}.png')
+            saved += 1
+            pbar.update(1)
+
+    pbar.close()
+    print(f"Unconditional images saved to {out_dir}")
+
+
 # ---------------------------------------------------------------------------
 # Real images: collect and save for FID reference
 # ---------------------------------------------------------------------------
 
 def save_real_images(data_dir: str, out_dir: Path, image_size: int,
                      n_per_class: int, seed: int = 0):
-    """Resize real images to image_size and save as grayscale PNG for FID."""
+    """Resize real images to image_size and save as grayscale PNG for FID.
+
+    Saves into per-sensor subdirectories (used with CFG / conditional mode).
+    """
     import random
     random.seed(seed)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -195,54 +284,99 @@ def save_real_images(data_dir: str, out_dir: Path, image_size: int,
     print(f"Real reference images saved to {out_dir}")
 
 
+def save_real_images_flat(data_dir: str, out_dir: Path, image_size: int,
+                          n_total: int, seed: int = 0):
+    """Sample n_total real images from ALL sensor classes into a flat directory.
+
+    Used for unconditional FID where generated images have no class structure.
+    """
+    import random
+    random.seed(seed)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = Path(data_dir)
+
+    all_files = []
+    for sensor in SENSORS:
+        sensor_dir = data_dir / 'challengers' / sensor / 'roll' / 'png'
+        if not sensor_dir.exists():
+            print(f"WARNING: {sensor_dir} not found, skipping.")
+            continue
+        all_files.extend(sorted(sensor_dir.glob('*.png')))
+
+    if len(all_files) == 0:
+        raise RuntimeError(f"No real images found under {data_dir}/challengers/")
+
+    sampled = random.sample(all_files, min(n_total, len(all_files)))
+    print(f"Sampling {len(sampled)}/{len(all_files)} real images for FID reference")
+
+    for i, fpath in enumerate(tqdm(sampled, desc='Real images (flat)')):
+        img = Image.open(fpath).convert('L')
+        img = img.resize((image_size, image_size), Image.LANCZOS)
+        img.save(out_dir / f'{i:05d}.png')
+
+    print(f"Real reference images saved to {out_dir}")
+
+
 # ---------------------------------------------------------------------------
 # FID computation via pytorch-fid
 # ---------------------------------------------------------------------------
 
+def _run_pytorch_fid(real_dir: Path, fake_dir: Path,
+                     batch_size: int = 64, device: str = 'cpu'):
+    """Low-level: run pytorch-fid on two *flat* image directories."""
+    cmd = [
+        sys.executable, '-m', 'pytorch_fid',
+        str(real_dir), str(fake_dir),
+        '--batch-size', str(batch_size),
+        '--device', device,
+        '--dims', '2048',
+        '--num-workers', '4',
+    ]
+    print('Running:', ' '.join(cmd))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    print(result.stdout)
+    if result.returncode != 0:
+        print('STDERR:', result.stderr)
+        raise RuntimeError('pytorch-fid failed')
+    for line in result.stdout.splitlines():
+        if 'FID' in line:
+            print(f"\n>>> {line.strip()}")
+
+
 def compute_fid(real_dir: Path, fake_dir: Path, batch_size: int = 64,
                 device: str = 'cpu'):
-    """Run pytorch-fid between two flat directories of images.
+    """Run pytorch-fid between real and fake image sets.
 
-    pytorch-fid expects two directories; we merge all class subdirs into
-    flat dirs for a single FID score over the full dataset.
+    Handles two layouts:
+    - Per-class subdirs (CFG mode): flattens sensor/* into temporary flat dirs.
+    - Flat dirs (unconditional mode): passes them directly to pytorch-fid.
     """
     import shutil, tempfile
 
-    # Flatten class subdirs into two temp flat dirs
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        flat_real = tmp / 'real'
-        flat_fake = tmp / 'fake'
-        flat_real.mkdir()
-        flat_fake.mkdir()
+    # Check if dirs contain sensor subdirectories
+    has_subdirs = any((fake_dir / s).exists() for s in SENSORS)
 
-        for sensor in SENSORS:
-            for src, dst in [(real_dir / sensor, flat_real),
-                             (fake_dir / sensor, flat_fake)]:
-                if not src.exists():
-                    continue
-                for f in src.glob('*.png'):
-                    shutil.copy(f, dst / f'{sensor}_{f.name}')
+    if has_subdirs:
+        # CFG mode: flatten sensor subdirs into temporary flat dirs
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            flat_real = tmp / 'real'
+            flat_fake = tmp / 'fake'
+            flat_real.mkdir()
+            flat_fake.mkdir()
 
-        cmd = [
-            sys.executable, '-m', 'pytorch_fid',
-            str(flat_real), str(flat_fake),
-            '--batch-size', str(batch_size),
-            '--device', device,
-            '--dims', '2048',
-            '--num-workers', '4',
-        ]
-        print('Running:', ' '.join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        print(result.stdout)
-        if result.returncode != 0:
-            print('STDERR:', result.stderr)
-            raise RuntimeError('pytorch-fid failed')
+            for sensor in SENSORS:
+                for src, dst in [(real_dir / sensor, flat_real),
+                                 (fake_dir / sensor, flat_fake)]:
+                    if not src.exists():
+                        continue
+                    for f in src.glob('*.png'):
+                        shutil.copy(f, dst / f'{sensor}_{f.name}')
 
-        # Parse FID value from output
-        for line in result.stdout.splitlines():
-            if 'FID' in line:
-                print(f"\n>>> {line.strip()}")
+            _run_pytorch_fid(flat_real, flat_fake, batch_size, device)
+    else:
+        # Unconditional mode: dirs are already flat
+        _run_pytorch_fid(real_dir, fake_dir, batch_size, device)
 
 
 # ---------------------------------------------------------------------------
@@ -288,32 +422,38 @@ def compute_fid_per_class(real_dir: Path, fake_dir: Path,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Generate 4K samples + compute FID vs NIST SD 302a')
+        description='Generate samples + compute FID vs real fingerprint images')
 
     parser.add_argument('--ckpt-dir', type=str, required=True,
-                        help='Path to orbax checkpoint directory (e.g. .../models/499)')
+                        help='Parent orbax checkpoint dir containing numbered '
+                             'step folders, e.g. '
+                             '.../patch-diffusion-fingerprint/flax/default/1')
     parser.add_argument('--data-dir', type=str, required=True,
-                        help='Path to images/ directory of NIST SD 302a')
+                        help='Path to directory that contains challengers/ '
+                             'subdirectory with real images')
     parser.add_argument('--out-dir', type=Path,
                         default='/kaggle/working/fid_eval')
     parser.add_argument('--image-size', type=int, default=256)
-    parser.add_argument('--n-samples', type=int, default=4000,
-                        help='Total samples to generate (split evenly across 8 classes)')
+    parser.add_argument('--n-samples', type=int, default=8000,
+                        help='Total samples to generate')
     parser.add_argument('--diffusion-steps', type=int, default=80)
-    parser.add_argument('--guidance-scale', type=float, default=3.0)
+    parser.add_argument('--guidance-scale', type=float, default=3.0,
+                        help='CFG scale (only used without --unconditional)')
+    parser.add_argument('--batch-per-device', type=int, default=16,
+                        help='Images per TPU chip per step. '
+                             'TPU v5e-8 has 8 chips → default 16 = 128 imgs/step')
+    parser.add_argument('--unconditional', action='store_true',
+                        help='Generate unconditionally (NULL_CLASS, no CFG). '
+                             'Recommended for FID evaluation.')
     parser.add_argument('--fid-batch-size', type=int, default=64)
     parser.add_argument('--device', type=str, default='cpu',
                         choices=['cpu', 'cuda'],
                         help='Device for pytorch-fid InceptionV3')
     parser.add_argument('--per-class-fid', action='store_true',
-                        help='Also compute FID per sensor class')
+                        help='Also compute per-sensor FID (CFG mode only)')
     parser.add_argument('--seed', type=int, default=0)
 
     args = parser.parse_args()
-
-    n_per_class = args.n_samples // NUM_CLASSES
-    print(f"Generating {n_per_class} images per class "
-          f"({n_per_class * NUM_CLASSES} total)")
 
     fake_dir = args.out_dir / 'fake'
     real_dir = args.out_dir / 'real'
@@ -329,34 +469,54 @@ if __name__ == '__main__':
     # Load checkpoint
     ema_params = load_ema_params(args.ckpt_dir, model, args.image_size)
 
-    # Generate fake images
-    generate_samples(
-        ema_params=ema_params,
-        model=model,
-        image_size=args.image_size,
-        n_per_class=n_per_class,
-        diffusion_steps=args.diffusion_steps,
-        guidance_scale=args.guidance_scale,
-        out_dir=fake_dir,
-        seed=args.seed,
-    )
-
-    # Save reference real images
-    save_real_images(
-        data_dir=args.data_dir,
-        out_dir=real_dir,
-        image_size=args.image_size,
-        n_per_class=n_per_class,
-        seed=args.seed,
-    )
+    if args.unconditional:
+        print(f"\n=== Unconditional generation: {args.n_samples} images ===")
+        generate_samples_uncond(
+            ema_params=ema_params,
+            model=model,
+            image_size=args.image_size,
+            n_samples=args.n_samples,
+            diffusion_steps=args.diffusion_steps,
+            out_dir=fake_dir,
+            batch_per_device=args.batch_per_device,
+            seed=args.seed,
+        )
+        save_real_images_flat(
+            data_dir=args.data_dir,
+            out_dir=real_dir,
+            image_size=args.image_size,
+            n_total=args.n_samples,
+            seed=args.seed,
+        )
+    else:
+        n_per_class = args.n_samples // NUM_CLASSES
+        print(f"\n=== CFG generation: {n_per_class} images × {NUM_CLASSES} classes "
+              f"= {n_per_class * NUM_CLASSES} total ===")
+        generate_samples(
+            ema_params=ema_params,
+            model=model,
+            image_size=args.image_size,
+            n_per_class=n_per_class,
+            diffusion_steps=args.diffusion_steps,
+            guidance_scale=args.guidance_scale,
+            out_dir=fake_dir,
+            seed=args.seed,
+        )
+        save_real_images(
+            data_dir=args.data_dir,
+            out_dir=real_dir,
+            image_size=args.image_size,
+            n_per_class=n_per_class,
+            seed=args.seed,
+        )
 
     # Compute FID
-    print("\n=== Overall FID4K ===")
+    print("\n=== Overall FID ===")
     compute_fid(real_dir, fake_dir,
                 batch_size=args.fid_batch_size,
                 device=args.device)
 
-    if args.per_class_fid:
+    if args.per_class_fid and not args.unconditional:
         print("\n=== Per-class FID ===")
         compute_fid_per_class(real_dir, fake_dir,
                               batch_size=args.fid_batch_size,
