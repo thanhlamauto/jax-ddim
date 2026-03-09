@@ -52,7 +52,22 @@ import subprocess
 import sys
 
 from model import DiffusionModel
-from train import make_full_pos, SENSORS, NUM_CLASSES, NULL_CLASS
+
+# Mirror constants from train.py to avoid importing wandb as a side-effect
+SENSORS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
+NUM_CLASSES = len(SENSORS)
+NULL_CLASS = NUM_CLASSES  # index 8 = unconditional token
+
+
+def make_full_pos(image_size: int, batch_size: int) -> np.ndarray:
+    """Full coordinate grid (batch_size, H, W, 2) for inference."""
+    y = np.arange(image_size, dtype=np.float32)
+    x = np.arange(image_size, dtype=np.float32)
+    y = (y / (image_size - 1) - 0.5) * 2.0
+    x = (x / (image_size - 1) - 0.5) * 2.0
+    xx, yy = np.meshgrid(x, y)
+    pos_single = np.stack([xx, yy], axis=-1)   # (H, W, 2)
+    return np.tile(pos_single[None], (batch_size, 1, 1, 1))
 
 
 # ---------------------------------------------------------------------------
