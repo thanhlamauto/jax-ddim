@@ -93,32 +93,21 @@ def load_ema_params(ckpt_dir: str, model: DiffusionModel,
     step = ckpt_manager.latest_step()
     print(f"Restoring checkpoint step {step} from {ckpt_dir}")
 
-    # Try orbax APIs in order from newest to oldest for compatibility
     target = {'ema_params': dummy_ema}
-    restored = None
 
-    # API 1: orbax >= 0.6 — partial_restore kwarg
+    # Preferred path: Orbax versions where partial_restore is a field of
+    # StandardRestore, not a kwarg on CheckpointManager.restore.
     try:
         restored = ckpt_manager.restore(
             step,
-            args=ocp.args.StandardRestore(target),
-            partial_restore=True,
+            args=ocp.args.StandardRestore(
+                target,
+                partial_restore=True,
+            ),
         )
     except TypeError:
-        pass
-
-    # API 2: orbax 0.4–0.5 — StandardRestore without partial_restore
-    if restored is None:
-        try:
-            restored = ckpt_manager.restore(
-                step,
-                args=ocp.args.StandardRestore(target),
-            )
-        except Exception:
-            pass
-
-    # API 3: orbax < 0.4 — legacy items= kwarg
-    if restored is None:
+        # Fallback for much older Orbax versions that don't support
+        # StandardRestore/partial_restore: restore via legacy items= API.
         restored = ckpt_manager.restore(step, items=target)
 
     return restored['ema_params']
