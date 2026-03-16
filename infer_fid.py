@@ -70,47 +70,68 @@ def make_full_pos(image_size: int, batch_size: int) -> np.ndarray:
     return np.tile(pos_single[None], (batch_size, 1, 1, 1))
 
 
-# ---------------------------------------------------------------------------
+﻿# ---------------------------------------------------------------------------
 # Checkpoint loading
 # ---------------------------------------------------------------------------
 
 def load_ema_params(ckpt_dir: str, model: DiffusionModel,
                     image_size: int):
-    """Restore only ema_params from an orbax checkpoint directory."""
+    """Restore EMA params from an Orbax checkpoint directory.
+
+    This implementation is deliberately conservative for maximum compatibility:
+    it lets Orbax restore the full checkpoint with its default handler and then
+    extracts EMA parameters from the restored structure, instead of trying to
+    configure partial-restore arguments (which vary a lot between versions).
+    """
     dummy_images = jnp.ones((1, image_size, image_size, 1), jnp.float32)
     dummy_labels = jnp.zeros((1,), jnp.int32)
     dummy_pos = jnp.zeros((1, image_size, image_size, 2), jnp.float32)
     dummy_rng = jax.random.PRNGKey(0)
 
-    variables = model.init(dummy_rng, dummy_images, dummy_labels,
-                           dummy_pos, dummy_rng)
-    dummy_ema = variables['params']
+    # Initialise model once so shapes are known (not strictly needed for restore,
+    # but kept for consistency and potential future use).
+    _ = model.init(dummy_rng, dummy_images, dummy_labels, dummy_pos, dummy_rng)
 
     ckpt_manager = ocp.CheckpointManager(
         str(ckpt_dir),
         options=ocp.CheckpointManagerOptions(),
     )
     step = ckpt_manager.latest_step()
+    if step is None:
+        raise RuntimeError(f"No checkpoint steps found under {ckpt_dir}")
     print(f"Restoring checkpoint step {step} from {ckpt_dir}")
 
-    target = {'ema_params': dummy_ema}
+    # Let Orbax decide how to restore; do not pass args/items so that this works
+    # across different versions and composite handlers.
+    restored = ckpt_manager.restore(step)
 
-    # Preferred path: Orbax versions where partial_restore is a field of
-    # StandardRestore, not a kwarg on CheckpointManager.restore.
-    try:
-        restored = ckpt_manager.restore(
-            step,
-            args=ocp.args.StandardRestore(
-                target,
-                partial_restore=True,
-            ),
-        )
-    except TypeError:
-        # Fallback for much older Orbax versions that don't support
-        # StandardRestore/partial_restore: restore via legacy items= API.
-        restored = ckpt_manager.restore(step, items=target)
+    # Common patterns:
+    # 1) {'state': TrainState(...), 'ema_params': params}
+    # 2) TrainState(...) with .params already being EMA
+    # 3) {'ema_params': params}
+    if isinstance(restored, dict):
+        if 'ema_params' in restored:
+            return restored['ema_params']
+        if 'state' in restored:
+            state = restored['state']
+            if hasattr(state, 'params'):
+                return state.params
+        # Some handlers may wrap a single item under 'default'
+        if 'default' in restored:
+            default_item = restored['default']
+            if isinstance(default_item, dict) and 'ema_params' in default_item:
+                return default_item['ema_params']
+            if hasattr(default_item, 'params'):
+                return default_item.params
 
-    return restored['ema_params']
+    # If it's not a dict, it might be a TrainState-like object.
+    if hasattr(restored, 'params'):
+        return restored.params
+
+    raise ValueError(
+        f"Could not find EMA parameters in restored checkpoint structure. "
+        f"Keys/attributes available: {getattr(restored, 'keys', lambda: list(restored.__dict__.keys()))()}"
+    )
 
 
 # ---------------------------------------------------------------------------
